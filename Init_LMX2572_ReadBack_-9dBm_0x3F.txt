@@ -1,0 +1,271 @@
+#include "compiler_defs.h"
+#include <C8051F380_defs.h>                 // SFR declarations
+#include <stdio.h>
+
+	//Port0:
+    // P0.0  -  SCK  (SPI0), Push-Pull,  Digital
+    // P0.1  -  MISO (SPI0), Open-Drain, Digital
+    // P0.2  -  MOSI (SPI0), Push-Pull,  Digital
+    // P0.3  -  NSS  (SPI0), Push-Pull,  Digital
+    // P0.4  -  TX0 (UART0), Push-Pull,  Digital
+    // P0.5  -  RX0 (UART0), Open-Drain, Digital
+	
+	//Port3:
+    // P3.5  -  LED_Red,  Push-Pull,  Digital
+
+	//Port4:
+	// P4.0  -  LED_Yellow, Push-Pull, Digital
+    // P4.1  -  CS_Att, Push-Pull, Digital
+    // P4.2  -  CS_LMX2592, Push-Pull, Digital
+    // P4.3  -  CS_LMX2572, Push-Pull, Digital
+    // P4.5  -  PWDN, Push-Pull,  Digital
+
+#define SYSCLK      12000000    // SYSCLK frequency in Hz
+#define BAUDRATE    	9600	// Baud rate of UART in bps
+#define SPI_CLOCK     250000    // Maximum SPI clock
+
+
+// Global Variables
+//-----------------------------------------------------------------------------
+sbit LED_Red = P3^5;		//SBIT(LED, SFR_P3, 5); 
+bit Error_Flag = 0;
+
+// Function Prototypes
+//-----------------------------------------------------------------------------
+void PCA0_Init (void);
+void Oscillator_Init(void);
+void Port_Init(void);
+void SPI0_Init(void);
+void UART0_Init (void);
+void Init_Device (void);
+void Init_LMX2572(void);
+void SPI_Array_Write (unsigned char pData[], unsigned char NumOfBytes);
+void Delay (void);
+void Delay_long (void);
+
+void PCA0_Init (void)
+{
+    PCA0MD = 0x00;		// Disable the Watchdog Timer
+   
+}	
+
+void Oscillator_Init()
+{
+    OSCICN    = 0x83;	// Set the internal oscillator to 12 MHz,
+                        // configrator sets 0xC3 (IFRDY flag)
+	RSTSRC  = 0x04;     // Enable missing clock detector: MCDRSF = 1
+}
+
+void Port_Init(void)
+{
+
+    P0MDOUT   = 0x1D;	// Make SCK, MOSI, NSS and UTX0 push-pull and MISO open drain 
+    P3MDOUT   = 0x20;	//Make the LED_Red push-pull at 3.5
+    P4MDOUT   = 0x2F;	//Slaves are disabled and LED_Yellow is ON
+	XBR0      = 0x03;	// Enable the SPI, UART on the XBAR
+    XBR1      = 0x40;	// Enable the XBAR and weak pull-ups
+	
+	P4 = 0x2F;			// Sets P4.0, P4.1, P4.2, P4.3, P4.5 HIGH
+}
+
+void SPI0_Init(void)
+{
+    SPI0CFG   = 0x40;	// Enable the SPI as a Master
+                        // CKPHA = '0', CKPOL = '0'
+    SPI0CN    = 0x0D;	// 4-wire Single Master, SPI enabled (NSSMD = 11), TXBMT = 0
+   
+	SPI0CKR   = (SYSCLK/(2*SPI_CLOCK))-1; // SPI clock frequency equation from the datasheet
+	ESPI0 = 1; 			// Enable SPI interrupts - equivalent with IE = 0x40
+						//but interrupts are not enabled globally (IE = 0xC0)	
+}
+
+void UART0_Init (void)
+{
+   SCON0 = 0x10;                       // SCON0: 8-bit variable bit rate
+                                       //        level of STOP bit is ignored
+                                       //        RX enabled
+                                       //        ninth bits are zeros
+                                       //        clear RI0 and TI0 bits
+   if (SYSCLK/BAUDRATE/2/256 < 1) {
+      TH1 = -(SYSCLK/BAUDRATE/2);
+      CKCON &= ~0x0B;                  // T1M = 1; SCA1:0 = xx
+      CKCON |=  0x08;
+   } else if (SYSCLK/BAUDRATE/2/256 < 4) {
+      TH1 = -(SYSCLK/BAUDRATE/2/4);
+      CKCON &= ~0x0B;                  // T1M = 0; SCA1:0 = 01                  
+      CKCON |=  0x01;
+   } else if (SYSCLK/BAUDRATE/2/256 < 12) {
+      TH1 = -(SYSCLK/BAUDRATE/2/12);
+      CKCON &= ~0x0B;                  // T1M = 0; SCA1:0 = 00
+   } else {
+      TH1 = -(SYSCLK/BAUDRATE/2/48);
+      CKCON &= ~0x0B;                  // T1M = 0; SCA1:0 = 10
+      CKCON |=  0x02;
+   }
+
+   TL1 = TH1;                          // Init Timer1
+   TMOD &= ~0xf0;                      // TMOD: timer 1 in 8-bit autoreload
+   TMOD |=  0x20;                       
+   TR1 = 1;                            // START Timer1
+   TI0 = 1;                            // Indicate TX0 ready
+}
+
+void Init_Device (void)
+{
+   PCA0_Init ();                       // Disable the Watchdog Timer first
+   Oscillator_Init ();
+   Port_Init ();
+   SPI0_Init ();
+   UART0_Init();
+}
+
+void Delay (void)
+{
+   unsigned long count;
+
+   for (count = 1000; count > 0; count--);
+}
+
+void SPI_Array_Write (unsigned char* pData, unsigned char NumOfBytes)
+{
+	unsigned char array_index;
+	printf("R%x\n", pData[0]);
+	while (!NSSMD0 || P4!=0x2F);    // Wait until the SPI is free, in case
+                                    // it's already busy
+
+	ESPI0 = 0;                      // Disable SPI interrupts
+	P4 = 0x26;						// Enable LMX2572 Slave and LED_Yellow is OFF
+									// P4 = '0010 0110'
+	Delay();
+   for (array_index = 0; array_index < NumOfBytes; array_index++)
+   {
+		SPI0DAT = pData[array_index]; // Load the data into the buffer
+		while (TXBMT != 1)    		// Wait until the data is moved into the XMIT buffer 
+		{
+			printf("TXBMT is not 1 yet\n");
+			/*
+			This bit will be set to logic 0 when new data has been written to the transmit buffer.
+			When data in the transmit buffer is transferred to the SPI shift register, this bit
+			will be set to logic 1, indicating that it is safe to write a new byte to the
+			transmit buffer	*/
+		}						      
+	    while (SPIF != 1)           // Wait until the last byte of the
+		{                           // data reaches the Slave
+			printf("SPIF is not 1 yet\n");
+			/*
+			This bit is set to logic 1 by hardware at the end of a data transfer.
+			If SPI interrupts are enabled, an interrupt will be generated.
+			This bit is not automatically cleared by hardware, and must be cleared by software.*/
+		}
+		SPIF = 0;					//Clear SPIF flag
+   }
+   P4 = 0x2F;                       // Disable the Slaves and LED_Yellow is ON
+   ESPI0 = 1;                       // Re-enable SPI interrupts
+}
+
+void Init_LMX2572(void)
+{
+//LMX2572 register declarations
+	unsigned char R0[3]  = {0x00, 0x22, 0x1E};	//RESET
+	unsigned char R114[3]= {0x72, 0x78, 0x02};	//R114	0x727802
+	unsigned char R78[3] = {0x4E, 0x02, 0x37};	//R78	0x4E0237
+	unsigned char R71[3] = {0x47, 0x00, 0x81};	//R71	0x470081
+	unsigned char R58[3] = {0x3A, 0x90, 0x01};	//R58	0x3A9001
+	unsigned char R57[3] = {0x39, 0x00, 0x20};	//R57	0x390020
+	unsigned char R45[3] = {0x2D, 0xCE, 0x1F};	//R45	0x2DCE1F
+	unsigned char R44[3] = {0x2C, 0x3F, 0xA3};	//R44	0x2C0AA3	//Lowest output power: 0x01, only OutA is active with 0x0A pwr (max pwr out: 0x2C3FA3)
+	unsigned char R43[3] = {0x2B, 0x00, 0x00};	//R43	0x2B0000
+	unsigned char R42[3] = {0x2A, 0x00, 0x00};	//R42	0x2A0000
+	unsigned char R39[3] = {0x27, 0x00, 0x01};	//R39	0x270001
+	unsigned char R38[3] = {0x26, 0x00, 0x00};	//R38	0x260000
+	unsigned char R37[3] = {0x25, 0x03, 0x05};	//R37	0x250305
+	unsigned char R36[3] = {0x24, 0x00, 0x40};	//R36	0x240040
+	unsigned char R30[3] = {0x1E, 0x18, 0xA6};	//R30	0x1E18A6
+	unsigned char R29[3] = {0x1D, 0x00, 0x00};	//R29	0x1D0000
+	unsigned char R20[3] = {0x14, 0x74, 0x48};	//R20	0x147448
+	unsigned char R19[3] = {0x13, 0x27, 0xB8};	//R19	0x1327B8
+	unsigned char R17[3] = {0x11, 0x00, 0xCC};	//R17	0x1100CC
+	unsigned char R14[3] = {0x0E, 0x18, 0x78};	//R14	0x0E1878
+	unsigned char R12[3] = {0x0C, 0x50, 0x01};	//R12	0x0C5001
+	unsigned char R11[3] = {0x0B, 0xB0, 0x18};	//R11	0x0BB018
+	unsigned char  R7[3] = {0x07, 0x40, 0xB2};	//R7	0x0740B2
+
+	printf("LMX2572 init started.\n");
+	LED_Red = 0;
+	
+	SPI_Array_Write(&R0, 3);		//RESET
+	printf("RESET\n");
+	printf("%x\n", R0[2]);
+	printf("%x\n", R0[1]);
+	printf("%x\n", R0[0]);
+	Delay();
+	SPI_Array_Write(&R114,3);	//Load registets
+	SPI_Array_Write(&R78, 3);
+	SPI_Array_Write(&R71, 3);
+	SPI_Array_Write(&R58, 3);
+	SPI_Array_Write(&R57, 3);
+	SPI_Array_Write(&R45, 3);	
+	SPI_Array_Write(&R44, 3);	
+	SPI_Array_Write(&R43, 3);	
+	SPI_Array_Write(&R42, 3);
+	SPI_Array_Write(&R39, 3);	
+	SPI_Array_Write(&R38, 3);	
+	SPI_Array_Write(&R37, 3);	
+	SPI_Array_Write(&R36, 3);	
+	SPI_Array_Write(&R30, 3);	
+	SPI_Array_Write(&R29, 3);
+	SPI_Array_Write(&R20, 3);
+	SPI_Array_Write(&R19, 3);
+	SPI_Array_Write(&R17, 3);	
+	SPI_Array_Write(&R14, 3);	
+	SPI_Array_Write(&R12, 3);	
+	SPI_Array_Write(&R11, 3);
+	SPI_Array_Write( &R7, 3);	
+	
+	R0[0]=0x00; R0[1]=0x21; R0[2]=0x18; 		//R0	0x00211C:	Muxout is in lock detect mode
+	SPI_Array_Write( &R0, 3);
+	LED_Red = 1;
+	printf("%x\n", R0[2]);
+	printf("%x\n", R0[1]);
+	printf("%x\n", R0[0]);
+	printf("LMX2572 init finished.\n");
+}
+
+
+void main(void)
+{	
+	Init_Device();
+	EA = 1;                             // Enable global interrupts	
+	Init_LMX2572();
+	
+	if (WCOL == 1) // Write collision occurred
+	{	
+		Error_Flag = 1;
+		WCOL = 0;		// Clear the write collision flag
+	}
+	
+	while(1)
+	{
+		if (Error_Flag == 1)
+		{
+			LED_Red = 1; 
+		}
+		else // Blanking - no error occurred
+		{			
+			LED_Red =0;
+			Delay_long();
+			LED_Red = 1;
+			Delay_long();
+		}
+	}
+	
+}
+
+void Delay_long (void)
+{
+   unsigned long count;
+
+   for (count = 100000; count > 0; count--);
+}
+
+
